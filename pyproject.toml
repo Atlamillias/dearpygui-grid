@@ -1,6 +1,6 @@
 [project]
 name = "dearpygui-grid"
-version = "1.0.0"
+version = "1.0.1"
 description = "Layout manager for Dear PyGui."
 authors = [{name="Anthony Doupe",email="atlamillias@outlook.com"}]
 keywords = []
