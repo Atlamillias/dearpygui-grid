@@ -90,7 +90,7 @@ dpg.start_dearpygui()
 
 In the example above, the target window item is configured using the `no_scrollbar` and `no_title_bar` settings. If you try running the script without them, you'll see that the grid does not take into account the size of the window's title bar, meaning that it will slightly overlap any content in the top row. Additionally, the content in the window consumes enough space for the scrollbar to display which, again, clips our content. But, what if you want the grid to behave *with* the scrollbar and title bar? Fortunately, this can also be managed by applying offsets, padding, and spacing to the layout.
 
-| Attribute  | Value Type     | Components | Description |
+| Attribute  | Value Type     | Length | Description |
 | :--------: | :------------: | :--------: | :---------: |
 | `.offsets` | `array[float]` | 4          | Space between the left, upper, right, and lower inner walls of the grid and its' content region.          |
 | `.padding` | `array[float]` | 4          | Space between the left, upper, right, and lower inner walls of the grid's slots and their content region. |
@@ -179,13 +179,6 @@ dpg.start_dearpygui()
     <br>
 </div>
 
->***Note**: The amount of space between slots can be also adjusted. The value found on the `.spacing` attribute is a 2-length array containing the spacing values for columns and rows respectively. It is effectively a different form of padding; a combination of a grid offset and slot padding value. Customization for slot spacing is limited compared in comparison (for now), so it is only briefly mentioned.*
+>***Note**: The amount of space between slots can be also adjusted. The value found on the `.spacing` attribute is a 2-length array containing the spacing values for columns and rows respectively. It is effectively a different form of padding; a combination of a grid offset and slot padding value.*
 
 <br>
-
-####Realistic Usage
-
-Not all layouts are as simple as aligning a few buttons symmetrically. A typical modern interface layout consists of a menu bar and/or ribbon, a side panel, main view, and maybe a footer bar. `Grid` is a versitile tool capable of this and more, but requires more of a dive into its' capabilities and a bit of creativity.
-
-```python
-```
