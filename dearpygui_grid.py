@@ -3,6 +3,7 @@ import numbers
 import functools
 import threading
 import dataclasses
+import math
 from array import array
 import dearpygui.dearpygui as dearpygui
 from dearpygui._dearpygui import (
@@ -22,6 +23,7 @@ from typing import (
     SupportsIndex,
     Sized,
     Iterable,
+    Annotated,
     TypeVar,
 
     overload,
@@ -31,21 +33,83 @@ from typing_extensions import Self
 
 
 
-
-# [ GENERAL TYPING ]
-
 _T = TypeVar('_T')
 _N = TypeVar('_N', bound=numbers.Real)
 
+Item   = int | str
+FloatV = float | None
+Vec2   = Annotated[tuple[FloatV, FloatV]                 | Sequence[FloatV], Literal[2]]
+Vec4   = Annotated[tuple[FloatV, FloatV, FloatV, FloatV] | Sequence[FloatV], Literal[4]]
 
-Item  = int | str
-
-NaN = float('nan')
+NaN = math.nan
 
 
 
 
-# [ CONFIG GETTERS/SETTERS ]
+# [ HELPER FUNCTIONS ]
+
+def _create_context():
+    # runs once, then no-op
+    dearpygui.create_context()
+    @functools.wraps(_create_context)
+    def create_context(): ...
+    setattr(sys.modules[__name__], _create_context.__name__, create_context)
+
+
+def _is_nan(v: Any) -> bool:
+    return v != v
+
+def _is_nanlike(v: Any) -> bool:
+    return v is None or v != v
+
+def _to_value(value: Any, default: Any):
+    if value is None or _is_nan(value):
+        return default
+    return value
+
+def _to_float_arr(value: Sequence[float | None] | float | None, length: int, default: float = NaN) -> 'array[float]':
+    """
+    # Non-Sequence value (None | float('nan'))
+    >>> arr = _to_float_array(None, 2)
+    >>> len(arr) == 2 and all(_is_nan(v) for v in arr)
+    True
+    >>> arr = _to_float_array(float("nan"), 2)
+    >>> len(arr) == 2 and all(_is_nan(v) for v in arr)
+    True
+
+    # Non-Sequence value (number)
+    >>> arr = _to_float_array(20, 4)
+    >>> len(arr) == 4 and all(v == 20 for v in arr)
+    True
+
+    # Sequence[float | nan | None], len(value) >= 4
+    >>> arr = _to_float_array([20, None, float("nan"), 10, 0, 0], 4, -5.0)  # 6-len input
+    >>> tuple(arr) == (20, -5.0, -5.0, 10)
+    True
+
+    # Sequence[float | float('nan') | None], len(value) < 4
+    >>> arr = _to_float_array([20, None], 4, -5.0)
+    >>> tuple(arr) == (20, -5.0, -5.0, -5.0)
+    True
+
+    """
+    if value is None or _is_nan(value):
+        return array('f', (default,) * length)
+    if isinstance(value, (float, int)):
+        return array('f', (value,) * length)
+
+    arr = array('f', (default,) * length)
+    try:
+        for i in range(length):
+            arr[i] = _to_value(value[i], default)
+    except IndexError:
+        pass
+    return arr
+
+
+
+
+# [ MINOR COMPONENTS ]  (major components/helpers of minor ones)
 
 class _RectGetter(Protocol):
     """A function that returns an item's size and position; as
@@ -59,6 +123,7 @@ def _get_item_rect(item: Item) -> tuple[int, int, int, int, bool]:
     if 'visible' in d:
         return *d['rect_size'], *d['pos'], d['visible']  # type: ignore
     return *d['rect_size'], *d['pos'], _item_get_config(item)['show']  # type: ignore
+
 
 
 
@@ -78,11 +143,15 @@ def _set_item_rect(item: Item, x_pos: int, y_pos: int, width: int, height: int, 
         show=show,
     )
 
+def _set_text_rect(item: Item, x_pos: int, y_pos: int, width: int, height: int, show: bool):
+    _item_set_config(
+        item,
+        pos=(int(x_pos), int(y_pos)),
+        show=show,
+    )
 
 
 
-
-# [ ITEM POSITION CALCULATORS ]
 
 class _Positioner(Protocol):
     """Calculates the final position of an item in the occupying cell
@@ -146,44 +215,49 @@ def _anchor_position_C(item_wt: float, item_ht: float, cell_x: float, cell_y: fl
 
 
 
-# [ HELPER FUNCTIONS ]
+@dataclasses.dataclass(slots=True)
+class ItemData:
+    """Contains the size and placement information of an item attached
+    to a `Grid` object.
 
-def _create_context():
-    # runs once, then no-op
-    dearpygui.create_context()
-    @functools.wraps(_create_context)
-    def create_context(): ...
-    setattr(sys.modules[__name__], _create_context.__name__, create_context)
+    Attributes:
+        * item (int | str): The target item's integer uuid or string alias.
+
+        * cellspan (tuple[int, int, int, int]): Contains coordinates for
+        the target cell range, as `(col_start, row_start, col_end, row_end)`.
+
+        * max_size (tuple[int, int]): Indicates the item's maximum width
+        and height (min 0 per value).
+
+        * padding (tuple[float, float, float, float]): Top-level padding
+        override values.
+
+        * positioner (_Positioner): Function used to calculate the item's
+        final position.
+
+        * rect_setter (_RectSetter): Callable used to update the item's size,
+        position, and visibility status.
+
+        * is_text (bool): If True, the target item an `mvText` object.
+    """
+    item       : Item
+    cellspan   : tuple[int, int, int, int]
+    max_size   : Sequence[float]
+    padding    : Sequence[float]
+    positioner : _Positioner
+    rect_setter: _RectSetter
+    is_text    : bool
+
+    def __hash__(self):
+        return hash(self.item)
 
 
-def _is_nan(v: Any):
-    return v != v
-
-
-def _is_null_v(value: Any, default: float = NaN):
-    return value is None or _is_nan(value)
-
-
-def _to_float_array(value: Sequence[float | None] | float | None, length: int, default: float = NaN):
-    arr = array('f', [default] * length)
-    if value is None or _is_nan(value):  # nan
-        return arr
-
-    for i in range(length):
-        v = value[i]  # type: ignore
-        if _is_null_v(v):
-            arr[i] = default  # type: ignore
-        else:
-            arr[i] = v  # type: ignore
-    return arr
 
 
 
+# [ MAJOR COMPONENTS ]
 
-
-# [ GRID COMPONENTS ]
-
-class _Configure(Generic[_T]):
+class _GridSetting(Generic[_T]):
     __slots__ = ("_key",)
 
     def __init__(self, key: str = '', /):
@@ -205,130 +279,196 @@ class _Configure(Generic[_T]):
         inst.configure(**{self._key: value})
 
 
-
-
-
-
-
 @dataclasses.dataclass(init=False)
-class Slot:
-    """Stores dedicated size settings of a row or column."""
-    __slots__ = ( '_label', '_size', '_weight', '_padding')
+class _GridComponent:
+    __slots__ = ('_label', '_spacing', '_padding')
 
-    label  : _Configure[str]         = dataclasses.field(default=_Configure('label'))
-    weight : _Configure[float]       = dataclasses.field(default=_Configure('weight'))
-    size   : _Configure[int]         = dataclasses.field(default=_Configure('size'))
-    padding: _Configure[list[float]] = dataclasses.field(default=_Configure('padding'))
+    label  : _GridSetting[str]            = dataclasses.field(default=_GridSetting('label'))
+    spacing: _GridSetting['array[float]'] = dataclasses.field(default=_GridSetting('spacing'))
+    padding: _GridSetting['array[float]'] = dataclasses.field(default=_GridSetting('padding'))
 
-    def __init__(self, label: str = '', *, weight: float = 1.0, size: int = 0, padding: Sequence[float] = (NaN, NaN)):
-        """Args:
-            * label: An informal name for the object.
+    def __init__(self, *, label: str | None = None, spacing: FloatV = None, padding: Vec2 | FloatV = None, **kwargs):
+        self.configure(label=label, spacing=spacing, padding=padding, **kwargs)
 
-            * weight: Affects dynamic slot scaling proportional to the size of the
-            grid and the total weight value of the axis.
+    def configure(self, **kwargs) -> None:
+        """Update the object's high-level settings.
 
-            * size: The width or height of the slot. A positive non-zero value
-            enforces a "fixed" sizing policy for the slot. Otherwise, the slot
-            uses a "sized" policy based on its' *weight*.
-
-            * padding: A 2-item sequence containing the amount of space between the
-            slot's walls and its' content region. When the slot is a column,
-            this is the first (x1_pad i.e. left-padding) and third (x2_pad i.e.
-            right-padding) value used for cell padding. When the slot is a row,
-            these values are the second (y1_pad i.e. upper-padding) and fourth
-            (y2_pad i.e. lower-padding) values, respectively.
+        Accepts all arguments accepted by the object's constructor
+        as keyword arguments.
         """
-        self.configure(label=label, size=size, weight=weight, padding=padding)
-
-    @overload
-    def configure(self, *, label: str = ..., weight: float = ..., size: int = ..., padding: Sequence[float] = ...): ...  # type: ignore
-    def configure(self, **kwargs):
-        """Update the slot's various settings."""
         if 'label' in kwargs:
-            self._label = kwargs['label']
-        if 'weight' in kwargs:
-            self._weight = max(0.0, kwargs['weight'] or 0.0) if not _is_null_v(kwargs['size']) else 0.0
-        if 'size' in kwargs:
-            self._size = max(0, int(kwargs['size'] or 0)) if not _is_null_v(kwargs['size']) else 0
+            self._label = kwargs['label'] or ''
         if 'padding' in kwargs:
-            self._padding = _to_float_array(kwargs['padding'], 2)
+            self._padding = _to_float_arr(kwargs['padding'], 2, NaN)
+        if 'spacing' in kwargs:
+            spacing = _to_value(kwargs['spacing'], None)
+            if spacing is None:
+                spacing = NaN
+            else:
+                spacing = max(0.0, spacing)
+            self._spacing = spacing
 
     def configuration(self) -> dict[str, Any]:
-        """Return the slot's settings and values."""
+        """Return a mapping of the object's settings and their current values."""
         return {f:getattr(self, f'_{f}') for f in self.__dataclass_fields__}
-
-    @property
-    def policy(self) -> Literal['FIXED', 'SIZED']:
-        return 'FIXED' if self._size else 'SIZED'
 
 
 @dataclasses.dataclass(init=False)
-class Axis(Iterable[Slot], Sized):
-    """Container for a `Grid` object's rows or columns.
+class Slot(_GridComponent):
+    """A row or column in a table-like structure.
+
+    Attributes:
+        * label: Informal name for the slot.
+
+        * spacing (float): Used to offset the slot's position during a draw
+        event. Is ignored for calculations when NaN.
+
+        * padding (array[float, float]): Used as the left/upper and right/lower
+        (for columns and rows respectively) padding values for cells in the slot
+        during a draw event. Inner NaN values are ignored for calculations.
+
+        * weight (float): During a draw event and when the slot's policy is
+        evaluated as "sized", this affects how much the slot is scaled
+        in proportion to the size of the grid and the total weight of all
+        other slots in the axis.
+
+        * size (int): The width/height (for columns and rows respectively) of
+        the slot. When this value is not 0, a "fixed" sizing policy is enforced
+        upon the slot, disabling dynamic resizing.
+
+
+    A slot's sizing policy is not set, but determined during a draw event
+    based on the slot's state. A "fixed" policy is enforced whenever a slot's
+    `.size` attribute is greater than 0, and uses a "sized" policy otherwise.
+    When "fixed", a slot is ensured to always be drawn to it's `.size`.
+
+    A slot is unaware of its' role in the grid (column vs row). A higher-level
+    object may indicate this through its' `.label` attribute.
+    """
+    __slots__ = ('_state', '_size', '_weight')
+
+    weight: _GridSetting[float] = dataclasses.field(default=_GridSetting('weight'))
+    size  : _GridSetting[int]   = dataclasses.field(default=_GridSetting('size'))
+
+    @overload
+    def __init__(self, *, label: str = ..., spacing: FloatV = ..., padding: Vec2 | FloatV = ..., weight: FloatV = ..., size: FloatV = ...) -> None: ...  # type: ignore
+    def __init__(self, *, weight: Any = 1.0, size: Any = 0, **kwargs) -> None:
+        """Args:
+            * label: Used to update `self.label`. None is treated as ''.
+
+            * spacing: Used to update `self.spacing`. A minimum 0 is used
+            for non-NaN values. None is treated as NaN.
+
+            * padding: Used to update `self.padding`. When the value is a
+            sequence, the first two items of the sequence are used as the
+            left/upper and right/lower (for columns and rows respectively)
+            padding values, where inner None values are treated as NaN.
+            Otherwise, the value is applied to all padding values while
+            treating NaN and None as `(NaN, NaN)`.
+
+            * weight: Used to update `self.weight`. A minimum of 0 is used
+            for non-NaN values. None is treated as NaN.
+
+            * size: Used to update `self.size`. A minimum of 0 is used for
+            non-NaN values. None is treated as NaN.
+        """
+        # managed by the parenting `Grid` during a draw event
+        self._state = cast(
+            dict[Literal['pos' ,'size', 'spacing', 'padding'], Any],
+            {
+                'pos'    : 0,
+                'size'   : 0,
+                'spacing': 0,
+                'padding': (0, 0),
+            }
+        )
+        super().__init__(weight=weight, size=size, **kwargs)
+
+    @overload
+    def configure(self, *, label: str = ..., spacing: FloatV = ..., padding: Vec2 | FloatV = ..., weight: FloatV = ..., size: FloatV = ...) -> None: ... # type: ignore
+    def configure(self, **kwargs) -> None:
+        if 'weight' in kwargs:
+            self._weight = max(0.0, _to_value(kwargs['weight'], 0.0))
+        if 'size' in kwargs:
+            self._size = max(0, int(_to_value(kwargs['size'], 0)))
+        super().configure(**kwargs)
+
+    def configuration(self) -> dict[Literal['label', 'spacing', 'padding', 'weight', 'size'], Any]: ...
+    del configuration
+
+
+@dataclasses.dataclass(init=False)
+class Axis(_GridComponent, Iterable[Slot], Sized):
+    """A collection of rows or columns.
+
+    Attributes:
+        * label (str): Informal name for the axis.
+
+        * spacing (float): Used as a fallback value to offset the slot's
+        position during a draw event. Is ignored for calculations when NaN.
+
+        * padding (array[float, float]): Fallback values used during a draw
+        event when a slot contained in the axis does not specify a padding
+        value. Inner NaN values are ignored for calculations.
+
+        * length (int): Evaluates to `len(self)`. Setting a value resizes
+        the length of the axis; adding or removing slots as necessary.
+
 
     Instances are treated as immutable, unsigned pseudo-integrals
     for most operations; the value of which is a representation
-    of the number of slots (rows or columns) in the axis. However,
-    in-place operations directly affect the number of slots they
-    contain.
+    of the number of slots in the axis. However, in-place operations
+    directly affect the number of slots contained.
 
-    Slots are identified by their positions (index) in the axis.
-    Indexing the axis returns the `Slot` object for that row or
-    column.
+    Axes objects behave similar to lists. Slots are identified by their
+    positions (index) in the axis. Indexing the axis returns the `Slot`
+    object for that row or column.
 
-    Slots are always appended to, or are removed from, the end of
-    the axis whenever the number of slots is updated.
+    When the axis' number of slots is changed, slots are always appended
+    to, or are removed from, the end of the axis.
 
     Operations that update the number of slots in the axis are
     thread-safe.
+
+    An axis object is unaware of its' role in the grid i.e. x
+    (columns) vs y (rows). A higher-level object may indicate this
+    through its' `.label` attribute.
     """
-    __slots__ = ('_slots', '_lock', '_label', '_spacing', '_padding')
+    __slots__ = ('_slots', '_lock')
 
-    label  : _Configure[str]         = dataclasses.field(default=_Configure('label'))
-    length : _Configure[int]         = dataclasses.field(default=_Configure('length'))
-    spacing: _Configure[float]       = dataclasses.field(default=_Configure('spacing'))
-    padding: _Configure[list[float]] = dataclasses.field(default=_Configure('padding'))
+    length: _GridSetting[int] = dataclasses.field(default=_GridSetting('length'))
 
-    def __init__(self, length: int = 0, *, label: str = '', spacing: float = NaN, padding: tuple[float, float] | Sequence[float] = (NaN, NaN)) -> None:
+    @overload
+    def __init__(self, length: int = ..., *, label: str = ..., spacing: FloatV = ..., padding: Vec2 | FloatV = ...) -> None: ...  # type: ignore
+    def __init__(self, length: int = 0, **kwargs) -> None:
         """Args:
-            * length: The initial number of slots.
+            * length: Integer value used to update `self.length`.
 
-            * label: An informal name for the object.
+            * label: Used to update `self.label`. None is treated as ''.
 
-            * spacing: The amount of empty space between slots in the axis.
+            * spacing: Used to update `self.spacing`. A minimum 0 is used
+            for non-NaN values. None is treated as NaN.
 
-            * padding: A 2-item sequence containing the amount of space between a
-            slot's walls and its' content region. When the axis contains columns
-            (x-axis), this is the first (x1_pad i.e. left-padding) and third (x2_pad
-            i.e. right-padding) value used for cell padding. If the axis contains
-            rows (y-axis), these values are the second (y1_pad i.e. upper-padding)
-            and fourth (y2_pad i.e. lower-padding) values, respectively.
-
-        A slot's padding component values are always used over the axis' padding
-        values, falling back to the axis' padding component value when the slot's
-        padding component value is missing.
+            * padding: Used to update `self.padding`. When the value is a
+            sequence, the first two items of the sequence are used as the
+            left/upper and right/lower (for columns and rows respectively)
+            padding values, where inner None values are treated as NaN.
+            Otherwise, the value is applied to all padding values while
+            treating NaN and None as `(NaN, NaN)`.
         """
         self._slots = cast(list[Slot], [])
         self._lock  = threading.Lock()
-        self.configure(label=label, length=length, spacing=spacing, padding=padding)
+        super().__init__(length=length, **kwargs)
 
     @overload
-    def configure(self, *, label: str = ..., length: int = ..., spacing: float = ..., padding: tuple[float, float] | Sequence[float] = ...): ...  # type: ignore
+    def configure(self, *, label: str = ..., spacing: FloatV = ..., padding: Vec2 | FloatV = ..., length: int = ...): ...  # type: ignore
     def configure(self, **kwargs):
-        """Update the axis' various settings."""
-        if 'label' in kwargs:
-            self._label = kwargs['label']
         if 'length' in kwargs:
             self.resize(kwargs['length'])
-        if 'padding' in kwargs:
-            self._padding = _to_float_array(kwargs['padding'], 2, NaN)
-        if 'spacing' in kwargs:
-            spacing = kwargs['spacing'] or 0.0
-            self._spacing = max(0.0, spacing) if not _is_null_v(spacing) else NaN
+        super().configure(**kwargs)
 
-    def configuration(self) -> dict[Literal['label', 'length', 'spacing', 'padding'], Any]:
-        """Return the axis' settings and values."""
-        return {f:getattr(self, f'_{f}') for f in self.__dataclass_fields__}  # type: ignore
+    def configuration(self) -> dict[Literal['label', 'spacing', 'padding', 'length'], Any]: ...
+    del configuration
 
     def __str__(self):
         return str(self._slots)
@@ -366,15 +506,13 @@ class Axis(Iterable[Slot], Sized):
     def __ge__(self, other: Any) -> bool:
         return len(self) >= other
 
-    @property
-    def weight(self) -> float:
-        """[get] Return the axis' total weight value."""
+    def slot_weight(self) -> float:
+        """Return the weight sum of all "sized" slots in the axis."""
         with self._lock:
             return sum(s._weight for s in self._slots if not s._size)
 
-    @property
-    def min_size(self) -> int:
-        """[get] Return the axis' minimum size when drawn."""
+    def slot_size(self) -> int:
+        """Return the size sum of all "fixed" slots in the axis."""
         with self._lock:
             return sum(s._size for s in self._slots)
 
@@ -443,7 +581,7 @@ class Axis(Iterable[Slot], Sized):
             return self
         if x > 0:
             with self._lock:
-                self._slots.extend(Slot(self._label) for _ in range(x))
+                self._slots.extend(Slot() for _ in range(x))
                 return self
         return self.__isub__(abs(x))
 
@@ -477,9 +615,6 @@ class Axis(Iterable[Slot], Sized):
         Args:
             * length: A positive number indicating the target length of
             the axis.
-
-
-        Slots are always added to, and removed from, the end of the axis.
 
 
         >>> x = Axis(8)
@@ -532,7 +667,7 @@ class Axis(Iterable[Slot], Sized):
             * index: Position of the new slot.
         """
         with self._lock:
-            self._slots.insert(index, Slot(self._label))
+            self._slots.insert(index, Slot())
 
     def remove(self, index: SupportsIndex = -1):
         """Delete the row/column at the specified index, or the last
@@ -547,86 +682,115 @@ class Axis(Iterable[Slot], Sized):
             self._slots.pop(index)
 
 
-
-
-@dataclasses.dataclass(slots=True, frozen=True)
-class ItemData:
-    """Contains the size and placement information of an item attached
-    to a `Grid` object.
-
-    Args:
-        * item: Item integer uuid or string alias.
-
-        * cellspan: a 4-tuple containing starting and ending cell coordinates
-        that the item will occupy, as `(col_start, row_start, col_end, row_end)`.
-
-        * max_size: A 2-item float array with the item's maximum width and
-        height. When it is desired to not specify a maximum size component, set
-        the value to zero.
-
-        * padding: A 4-item sequence of padding override values for the item, as
-        `[left-padding, upper-padding, right-padding, bottom-padding]`. When it
-        is desired to not override a padding component, set the padding value to
-        infinity (`float(inf)`).
-
-        * positioner: A helper function that calculates an item's final position.
-
-        * rect_setter: The function that will be called to update the item's size,
-        position, and visibility status.
-    """
-    item       : Item
-    cellspan   : tuple[int, int, int, int]
-    max_size   : Sequence[float]           = dataclasses.field(default_factory=lambda: array('f', (0.0, 0.0)))
-    padding    : Sequence[float]           = dataclasses.field(default_factory=lambda: array('f', (NaN, NaN, NaN, NaN)))
-    positioner : _Positioner               = _get_positioner('centered')
-    rect_setter: _RectSetter               = _set_item_rect
-
-    def __hash__(self):
-        return hash(self.item)
-
-
-@dataclasses.dataclass(slots=True)
-class CellData:
-    """Contains individual grid cell properties calculated in a single
-    frame.
-    """
-    col   : int
-    row   : int
-    x_pos : float = 0.0
-    y_pos : float = 0.0
-    width : float = 0.0
-    height: float = 0.0
-    x1_pad: float = 0.0
-    y1_pad: float = 0.0
-    x2_pad: float = 0.0
-    y2_pad: float = 0.0
-
-    @property
-    def cell(self):
-        """[get] Return the cell's column and row coordinates."""
-        return self.col, self.row
-
-    def __hash__(self):
-        return hash((self.col, self.row))
-
-
 @dataclasses.dataclass(init=False)
-class Grid:
-    """A layout manager for Dear PyGui."""
+class Grid(_GridComponent):
+    """Layout manager for Dear PyGui, emulating a table-like structure.
+
+    Attributes:
+        * cols (Axis): Living representation of the grid's columns (x-axis).
+        See the `Axis` class for more information.
+
+        * rows (Axis): Living representation of the grid's rows (y-axis).
+        See the `Axis` class for more information.
+
+        * target (int | str): The integer identifier or string alias of the
+        item used as the grid's positional reference. Additionally, it's
+        visibility state is used to determine whether or not to display (draw)
+        the grid. The size of the target item is also used as fallback values
+        as necessary when `self.width` and/or `self.height` are not applicable.
+
+        * label (str): An informal name for the grid.
+
+        * spacing (array[float, float]): Values used to offset a slot's (columns
+        and rows, respectively) position during a draw event when both
+        `slot.spacing` and `axis.spacing` are not applicable (min. 0 per value).
+
+        * padding (array[float, float, float, float]): Used as the left, upper,
+        right, and lower padding values during a draw event when item-level
+        padding override values were not provided and both `slot.spacing` and
+        `axis.spacing` are not applicable. The first and third values are used
+        for column padding, while the second and fourth values are used for rows
+        (min. 0 per value).
+
+        * width (int): The horizontal size of the grid. Can be used to extend
+        the grid beyond the default view of the target item, allowing for items
+        to be positioned in their parent's scroll area. If 0, the width of the
+        target item is used instead (min. 0).
+
+        * height (int): The vertical size of the grid. Can be used to extend
+        the grid beyond the default view of the target item, allowing for items
+        to be positioned in their parent's scroll area. If 0, the height of the
+        target item is used instead (min. 0).
+
+        * offsets (array[float, float, float, float]): Similar to padding, but
+        targets the left, upper, right, and lower edges of the grid itself and
+        not its' slots. Can be used to expand or shrink the size of the grid's
+        content region (min. 0 per value).
+
+        * rect_getter (_RectGetter): Called before attempting to draw the grid
+        to fetch the target item's size, position, and visibility status. The
+        default implementation is a light wrapper around
+        `dearpygui.get_item_state`. It may also call
+        `dearpygui.get_item_configuration` if one or more details cannot be
+        accessed by reading the item's state.
+
+        * overlay (bool): If True, a visual representation of the grid will be
+        displayed over it.
+
+        * show (bool): If True, the grid and its' content will be visible.
+
+
+    The grid calculates the positions, sizes, and visibility states of
+    itself and attached items during a draw event; triggered by calling the
+    grid. The grid must be frequently drawn in order for it to operate as
+    expected, performing best when registered as the resize callback for its'
+    target item or the parenting root-level window. However, the grid can
+    registered as any Dear PyGui callback or even called directly.
+
+    The grid does not use or create items to assist with the layout. Any item
+    generated by the grid is used for its' overlay, enabled when `self.overlay`
+    is True. A class-level `mvViewportDrawlist` item is created when the first
+    instance of `Grid` is created, while a `mvDrawLayer` item is created per
+    `Grid` instance. When `self.overlay` is False, no additional items are
+    created.
+
+    When a draw event occurs, the "draw" step is skipped when the grid is
+    not visible. Additionally, the grid, its content, and overlay are drawn
+    and displayed only if the visibility value returned from `self.rect_getter`
+    is True, regardless of the value of `self.show` and `self.overlay`.
+
+    Items can be attached to the grid via the `.push` method. When sizing and
+    positioning an item during a draw event, settings provided when attatching
+    the item (padding, spacing, etc.) are used over slot, axis and grid settings.
+    If setting(s) are unspecified (usually indicated by None or NaN), the grid
+    falls back to using settings found on the slot, then axis, etc.
+
+    There are situations where an item may be hidden when drawing
+    the grid:
+        * the item's cellspan is outside of the grid's current
+        range
+        * given the constraints of the slots in the target cellspan,
+        the size of the item is calculated to be less than 1 pixel
+
+    Any item attached to the grid that does not exist at the time
+    of a draw event is silently dropped from the grid, and will not
+    be managed further.
+
+    For more information, see `Grid.__init__`, `Grid.__call__` and `Grid.push`.
+
+    """
     __slots__ = (
         # internal
         '_lock',
         '_item_data',
+        '_trashbin',
         '_drawlayer',
         # configuration
         'rows',
         'cols',
-        '_label',
         '_width',
         '_height',
         '_offsets',
-        '_padding',
-        '_spacing',
         '_target',
         '_rect_getter',
         '_overlay',
@@ -635,134 +799,115 @@ class Grid:
         '__weakref__',
     )
 
-    label      : _Configure[str]         = dataclasses.field(default=_Configure("label"))
-    width      : _Configure[int]         = dataclasses.field(default=_Configure("width"))
-    height     : _Configure[int]         = dataclasses.field(default=_Configure("height"))
-    offsets    : _Configure[list[float]] = dataclasses.field(default=_Configure("offsets"))
-    padding    : _Configure[list[float]] = dataclasses.field(default=_Configure("padding"))
-    spacing    : _Configure[list[float]] = dataclasses.field(default=_Configure("spacing"))
-    target     : _Configure[Item]        = dataclasses.field(default=_Configure("target"))
-    rect_getter: _Configure[_RectGetter] = dataclasses.field(default=_Configure("rect_getter"))
-    overlay    : _Configure[bool]        = dataclasses.field(default=_Configure("overlay"))
-    show       : _Configure[bool]        = dataclasses.field(default=_Configure("show"))
+    target     : _GridSetting[Item]           = dataclasses.field(default=_GridSetting("target"))
+    spacing    : _GridSetting['array[float]'] = dataclasses.field(default=_GridSetting("spacing"))  # float -> array[float]
+    width      : _GridSetting[int]            = dataclasses.field(default=_GridSetting("width"))
+    height     : _GridSetting[int]            = dataclasses.field(default=_GridSetting("height"))
+    offsets    : _GridSetting['array[float]'] = dataclasses.field(default=_GridSetting("offsets"))
+    rect_getter: _GridSetting[_RectGetter]    = dataclasses.field(default=_GridSetting("rect_getter"))
+    overlay    : _GridSetting[bool]           = dataclasses.field(default=_GridSetting("overlay"))
+    show       : _GridSetting[bool]           = dataclasses.field(default=_GridSetting("show"))
 
-    def __init_subclass__(cls):
-        super().__init_subclass__()
-        if cls.__code__ is not cls.__call__.__code__:
-            cls.__code__ = cls.__call__.__code__
+    __drawlist = '[mvViewportDrawlist] Grid'
 
-    def __init__(  # type: ignore
+    @overload
+    def __init__(self, cols: int = ..., rows: int = ..., target: Item = ..., *, label: str | None = ..., padding: Vec4 | FloatV = ..., spacing: Vec2 | FloatV = ..., width: FloatV = ..., height: FloatV = ..., offsets: Vec4 | FloatV = ..., rect_getter: _RectGetter = ..., overlay: bool = ..., show: bool = ...) -> None: ...  # type: ignore
+    def __init__(
         self,
-        cols       : int             = 1,
-        rows       : int             = 1,
-        target     : Item            = 0,
+        cols       : int  = 1,
+        rows       : int  = 1,
+        target     : Item = 0,
         *,
-        label      : str             = '',
-        width      : int             = 0,
-        height     : int             = 0,
-        offsets    : Sequence[float] = (0, 0, 0, 0),
-        padding    : Sequence[float] = (0, 0, 0, 0),
-        spacing    : Sequence[float] = (0, 0),
-        rect_getter: _RectGetter     = _get_item_rect,
-        overlay    : bool            = False,
-        show       : bool            = True,
-    ):
+        width      : Any  = None,
+        height     : Any  = None,
+        offsets    : Any  = None,
+        rect_getter: Any  = None,
+        overlay    : bool = False,
+        show       : bool = True,
+        **kwargs,
+    ) -> None:
         """Args:
-            * cols: Number of initial columns.
+            * cols: Integer value used to update `self.cols` via `self.cols.resize`.
+            Sets the number of slots in the x-axis.
 
-            * rows: Number of initial rows.
+            * rows: Integer value used to update `self.rows` via `self.rows.resize`.
+            Sets the number of slots in the y-axis.
 
-            * target: The unique identifier of an existing item. The grid
-            will scale with this item, unless *width*/*height* is set.
+            * target: Integer or string value used to update `self.target`. Non-
+            optional in most cases.
 
-            * label: An informal name for the grid.
+            * label: Used to update `self.label`. None is treated as ''.
 
-            * rect_getter: A callable that accepts *target* as a positional
-            argument and returns a 5-tuple containing a related width, height,
-            x-position, y-position, and visibility status.
+            * rect_getter: Used to update `self.rect_getter`. Should be None, or a
+            callable accepting `self.target` as a positional argument and returns a
+            5-tuple containing a related width, height, x-position, y-position, and
+            visibility status. None is treated as the internal default value.
 
-            * width: Overrides *target* width when drawing the grid.
+            * width: Used to update `self.width`. Sets a minimum value of 0.
+            None is treated as 0.
 
-            * height: Overrides *target* height when drawing the grid.
+            * height: Used to update `self.height`. Sets a minimum value of 0.
+            None is treated as 0.
 
-            * offsets: A 4-length sequence indicating the amount of empty
-            space between the each of the grid's walls and the content region.
+            * offsets: Used to update `self.offsets`. When the value is a
+            sequence, the first four items are used as the grid's left, upper,
+            right, and lower inner padding values, where inner None values are
+            treated as 0. Otherwise, the value is applied to all padding values
+            while treating NaN and None as `(0, 0, 0, 0)`.
 
-            * padding: A 4-item sequence containing the amount of space between a
-            slot's inner walls and their content regions. The first and third values
-            are for column left and right padding respectively, while the second
-            and fourth values are the upper and lower padding values for rows.
+            * padding: Used to update `self.padding`. When the value is a
+            sequence, the first four items are used as the left, upper,
+            right, and lower padding values for slots, where inner None values
+            are treated as 0. Otherwise, the value is applied to all padding values
+            while treating NaN and None as `(0, 0, 0, 0)`.
 
-            * spacing: A 2-length sequence indicating the amount of empty space
-            between slots.
+            * spacing: Used to update `self.spacing`. When the value is a
+            sequence, the first two items are used as column and row spacing values,
+            where inner None values are treated as 0. Otherwise, the value is applied
+            to all spacing values while treating NaN and None as `(0, 0)`.
 
-            * overlay: Show/hide the visual representation of the grid and its'
-            rows and columns. Useful when planning/designing layouts.
+            * overlay: Used to update `self.overlay`. Evaluated as a boolean, True
+            will cause the overlay to be displayed once a draw event has been
+            triggered.
 
-            * show: Show/hide grid and its' managed items.
-
-        If *rect_getter* is unspecified, `dearpygui.get_item_state` is called
-        to fetch the size, position, and visibility state of *target*. This
-        means that `rect_size` and `pos` must be included in the dictionary
-        returned from `dearpygui.get_item_state(target)`. For some items,
-        `dearpygui.get_item_configuration` may also be called if the 'visible'
-        key is missing from the item's state mapping.
-
-        *target* is non-optional, unless *rect_getter* is specified.
-
-        When drawn, the grid is sized to *width*/*height*, or to the
-        width/height of *target* when *width*/*height* is unspecified.
-
-        The size(s) and position(s) of the grid and its managed items are
-        only updated when *target* is visible and when *show* is True.
-        Additionally, the grid's overlay is drawn only when the grid would
-        be drawn and when *overlay* is True.
-
-        *offsets* is expected to be a sequence 4 items in length, as
-        `[left_offset, upper_offset, right_offset, bottom_offset]`.
-
-        When *show* is True/False, the visibility state (`show`) of all items
-        managed by the grid will also be set to True/False.
-
-        False-like configuration option values are evaluated as the option's
-        default value. Additionally, options that expect numeric values
-        are evaluated as zero when the value is False-like or when it compares
-        less than zero. When a configuration option's value is set to the
-        default/minimum value, that option is considered "not set" or
-        "unspecified".
-
-        >NOTE: Be mindful of calls made to the grid within your custom
-        *rect_getter*. Under normal operation, attempting to update or
-        draw the grid will result in a deadlock!
+            * show: Used to update `self.show`. Evaluated as a boolean,
+            False will hide the grid, its' overlay, and all attached items (and
+            vice-versa).
         """
-        assert self.__code__ == self.__call__.__code__
         _create_context()
-        self.cols = Axis(0, label='x')
-        self.rows = Axis(0, label='y')
-
         if not dearpygui.does_item_exist(self.__drawlist):
             type(self).__drawlist = dearpygui.add_viewport_drawlist()
         self._drawlayer = dearpygui.add_draw_layer(parent=self.__drawlist)
         self._item_data = cast(set[ItemData], set())
+        self._trashbin  = set()
         self._lock      = threading.Lock() if not sys.gettrace() else threading.RLock()
 
-        self.configure(
+        self.cols = Axis(0, label='x')
+        self.rows = Axis(0, label='y')
+
+        super().__init__(
             rows=rows,
             cols=cols,
-            label=label,
             width=width,
             height=height,
             offsets=offsets,
-            padding=padding,
-            spacing=spacing,
             target=target,
             rect_getter=rect_getter,
             overlay=overlay,
             show=show,
+            **kwargs,
         )
 
+    def _clean_cache(self):
+        # currently called before or after:
+        #   * updating the grid's settings
+        #   * updating `self._item_data`
+        #   * drawing the grid
+        self._item_data.difference_update(self._trashbin)
+        self._trashbin.clear()
+
     @overload
-    def configure(self, *, cols: int = ..., rows: int = ..., label: str = ..., width: int = ..., height: int = ..., offsets: Sequence[float] = ..., padding: Sequence[float] = ..., spacing: Sequence[float] = ..., target: Item = ..., rect_getter: _RectGetter = ..., overlay: bool = ..., show: bool = ...): ...  # type: ignore
+    def configure(self, *, cols: int = ..., rows: int = ..., target: Item = ..., label: str | None = ..., padding: Vec4 | FloatV = ..., spacing: Vec2 | FloatV = ..., offsets: Vec4 | FloatV = ..., width: FloatV = ..., height: FloatV = ..., rect_getter: _RectGetter = ..., overlay: bool = ..., show: bool = ...): ...  # type: ignore
     def configure(self, **kwargs):
         """Update the grid's settings.
 
@@ -781,9 +926,6 @@ class Grid:
                     raise TypeError(f'expected int for `rows` (got {type(rows)!r}).')
                 self.rows.resize(kwargs['rows'])
 
-            if 'label' in kwargs:
-                self._label = kwargs['label'] or ''
-
             if 'target' in kwargs or 'rect_getter' in kwargs:
                 target      = kwargs.get('target', getattr(self, '_target', 0)) or 0
                 rect_getter = kwargs.get('rect_getter', getattr(self, '_rect_getter', _get_item_rect)) or _get_item_rect
@@ -797,24 +939,26 @@ class Grid:
                     if not callable(rect_getter):
                         raise TypeError(f'expected callable for `rect_getter`, got {type(rect_getter)!r}.') from None
                     raise
+                except SystemError:
+                    if target and dearpygui.does_item_exist(target):
+                        raise
+
                 self._target      = target
                 self._rect_getter = rect_getter
 
             # sizing
             if 'width' in kwargs:
-                width = int(max(0, kwargs.get('width' , getattr(self, '_width' , 0)) or 0))
-                self._width = width
+                self._width = int(max(0, _to_value(kwargs['width'], 0)))
             if 'height' in kwargs:
-                height = int(max(0, kwargs.get('height' , getattr(self, '_height' , 0)) or 0))
-                self._height = height
+                self._height = int(max(0, _to_value(kwargs['height'], 0)))
 
             # offsets
             if 'offsets' in kwargs:
-                self._offsets = _to_float_array(kwargs['offsets'], 4, 0.0)
+                self._offsets = _to_float_arr(kwargs['offsets'], 4, 0.0)
             if 'padding' in kwargs:
-                self._padding = _to_float_array(kwargs['padding'], 4, 0.0)
+                self._padding = _to_float_arr(kwargs.pop('padding'), 4, 0.0)  # override
             if 'spacing' in kwargs:
-                self._spacing = _to_float_array(kwargs['spacing'], 2, 0.0)
+                self._spacing = _to_float_arr(kwargs.pop('spacing'), 2, 0.0)  # override
 
             # visibility
             if 'overlay' in kwargs:
@@ -823,28 +967,20 @@ class Grid:
                 self._overlay = overlay
             if 'show' in kwargs:
                 show = bool(kwargs['show'])
-                _rm_items = []
                 if not show:
                     _item_set_config(self._drawlayer, show=False)
-                    for item_data in self._item_data:
-                        try:
-                            _item_set_config(item_data.item, show=False)
-                        except SystemError:
-                            if not dearpygui.does_item_exist(item_data.item):
-                                _rm_items.append(item_data)
-                            else:
-                                raise
-                else:
-                    for item_data in self._item_data:
-                        try:
-                            _item_set_config(item_data.item, show=True)
-                        except SystemError:
-                            if not dearpygui.does_item_exist(item_data.item):
-                                _rm_items.append(item_data)
-                            else:
-                                raise
-                self._item_data.difference_update(_rm_items)
+                for item_data in self._item_data:
+                    try:
+                        _item_set_config(item_data.item, show=show)
+                    except SystemError:
+                        if not dearpygui.does_item_exist(item_data.item):
+                            self._trashbin.add(item_data)
+                        else:
+                            raise
                 self._show = show
+
+            super().configure(**kwargs)
+            self._clean_cache()
 
     def configuration(self):
         """Return the grid's various settings and values."""
@@ -852,22 +988,59 @@ class Grid:
         cfg.update({f:getattr(self, f'_{f}') for f in self.__dataclass_fields__})
         return cfg
 
+    def _pop(self, item: Item):
+        # Two instances of `ItemData` can potentially exist for the same item
+        # since refs can be integers or strings. Try to remove all of them just
+        # in case.
+        if not dearpygui.does_item_exist(item):
+            self._trashbin.add(item)
+        else:
+            if isinstance(item, str):
+                refs = (item, dearpygui.get_alias_id(item), dearpygui.get_item_alias(item))
+            else:
+                refs = (item, dearpygui.get_item_alias(item))
+            self._trashbin.update(refs)
+            _item_set_config(item, pos=())
+        self._clean_cache()
+
+    def pop(self, item: Item):
+        """Release an item from the grid.
+
+        Awaits internal lock release.
+        """
+        with self._lock:
+            self._pop(item)
+
+    def clear(self):
+        """Release all items from the grid.
+
+        Awaits internal lock release.
+        """
+        with self._lock:
+            for item_data in self._item_data:
+                try:
+                    _item_set_config(item_data.item, pos=())
+                except SystemError:
+                    pass
+            self._trashbin.update(self._item_data)
+            self._clean_cache()
+
     ANCHORS = tuple(s.lower() for s in _ANCHOR_MAP)
 
     @overload
-    def push(self, item: Item, col: int, row: int, /, *, anchor: str = ..., rect_setter: _RectSetter = ..., max_size: tuple[int | None, int | None] | Sequence[int | None] = ..., padding: tuple[int | None, int | None, int | None, int | None] | Sequence[int | None] = ...): ...
+    def push(self, item: Item, col: int, row: int, /, *, anchor: str = ..., rect_setter: _RectSetter = ..., max_size: Vec2 | FloatV = ..., padding: Vec4 | FloatV = ...): ...
     @overload
-    def push(self, item: Item, col: int, row: int, /, *, anchor: str = ..., rect_setter: _RectSetter = ..., max_width: int = ..., max_height: int = ..., padding: tuple[int | None, int | None, int | None, int | None] | Sequence[int | None] = ...): ...
+    def push(self, item: Item, col: int, row: int, /, *, anchor: str = ..., rect_setter: _RectSetter = ..., max_width: int = ..., max_height: int = ..., padding: Vec4 | FloatV = ...): ...
     @overload
-    def push(self, item: Item, col: int, row: int, /, *, anchor: str = ..., rect_setter: _RectSetter = ..., max_size: tuple[int | None, int | None] | Sequence[int | None] = ..., x1_pad: int = ..., y1_pad: int = ..., x2_pad: int = ..., y2_pad: int = ...): ...
+    def push(self, item: Item, col: int, row: int, /, *, anchor: str = ..., rect_setter: _RectSetter = ..., max_size: Vec2 | FloatV = ..., x1_pad: int = ..., y1_pad: int = ..., x2_pad: int = ..., y2_pad: int = ...): ...
     @overload
     def push(self, item: Item, col: int, row: int, /, *, anchor: str = ..., rect_setter: _RectSetter = ..., max_width: int = ..., max_height: int = ..., x1_pad: int = ..., y1_pad: int = ..., x2_pad: int = ..., y2_pad: int = ...): ...
     @overload
-    def push(self, item: Item, cell_start: tuple[int, int] | Sequence[int], cell_stop: tuple[int, int] | Sequence[int] | None = ..., /, *, anchor: str = ..., rect_setter: _RectSetter = ..., max_size: tuple[int | None, int | None] | Sequence[int | None] = ..., padding: tuple[int | None, int | None, int | None, int | None] | Sequence[int | None] = ...): ...
+    def push(self, item: Item, cell_start: tuple[int, int] | Sequence[int], cell_stop: tuple[int, int] | Sequence[int] | None = ..., /, *, anchor: str = ..., rect_setter: _RectSetter = ..., max_size: Vec2 | FloatV = ..., padding: Vec4 | FloatV = ...): ...
     @overload
-    def push(self, item: Item, cell_start: tuple[int, int] | Sequence[int], cell_stop: tuple[int, int] | Sequence[int] | None = ..., /, *, anchor: str = ..., rect_setter: _RectSetter = ..., max_width: int = ..., max_height: int = ..., padding: tuple[int | None, int | None, int | None, int | None] | Sequence[int | None] = ...): ...
+    def push(self, item: Item, cell_start: tuple[int, int] | Sequence[int], cell_stop: tuple[int, int] | Sequence[int] | None = ..., /, *, anchor: str = ..., rect_setter: _RectSetter = ..., max_width: int = ..., max_height: int = ..., padding: Vec4 | FloatV = ...): ...
     @overload
-    def push(self, item: Item, cell_start: tuple[int, int] | Sequence[int], cell_stop: tuple[int, int] | Sequence[int] | None = ..., /, *, anchor: str = ..., rect_setter: _RectSetter = ..., max_size: tuple[int | None, int | None] | Sequence[int | None] = ..., x1_pad: int = ..., y1_pad: int = ..., x2_pad: int = ..., y2_pad: int = ...): ...
+    def push(self, item: Item, cell_start: tuple[int, int] | Sequence[int], cell_stop: tuple[int, int] | Sequence[int] | None = ..., /, *, anchor: str = ..., rect_setter: _RectSetter = ..., max_size: Vec2 | FloatV = ..., x1_pad: int = ..., y1_pad: int = ..., x2_pad: int = ..., y2_pad: int = ...): ...
     @overload
     def push(self, item: Item, cell_start: tuple[int, int] | Sequence[int], cell_stop: tuple[int, int] | Sequence[int] | None = ..., /, *, anchor: str = ..., rect_setter: _RectSetter = ..., max_width: int = ..., max_height: int = ..., x1_pad: int = ..., y1_pad: int = ..., x2_pad: int = ..., y2_pad: int = ...): ...
     def push(self, item: Item, cell_start: Any, cell_stop: Any = None, /, *, anchor: str = 'c', rect_setter: _RectSetter = _set_item_rect, max_size: Any = None, max_width: Any = None, max_height: Any = None, padding: Any = None, x1_pad: Any = None, y1_pad: Any = None, x2_pad: Any = None, y2_pad: Any = None):
@@ -878,94 +1051,112 @@ class Grid:
         Args:
             * item: Integer uuid or string alias of an item.
 
-            * col, cell_start: Index of the cell's column that will contain the item,
-            OR a 2-item sequence containing both the column and row indices of the
-            initial cell of the cell range the item will occupy.
+            * col, cell_start: Index of the cell's column that will contain the
+            item, OR a 2-item sequence containing both the column and row indices
+            of the initial cell of the cell range the item will occupy.
 
             * row, cell_stop: Index of the cell's row that will contain the item,
             OR a 2-item sequence containing both the column and row indices of the
             last cell of the cell range the item will occupy.
 
-            * anchor: A (inter)cardinal direction name ("north", "southwest", etc) or
-            abbreviation ("n", "sw", etc) indicating the area of the cell the item will
-            "stick" to. "c(enter)" will result in the item being centered in the
-            specified cell or cellspan. Value is case-insensitive. Defaults to "c".
+            * anchor: A (inter)cardinal direction name (e.g. "north", "southwest")
+            or abbreviation (e.g. "n", "sw") indicating the area of the cell the
+            item will "stick" to. "center", "centered", or "c" will result in the
+            item being centered in the specified cell or cellspan (default). Value
+            is case-insensitive.
 
             * rect_setter: A callable accepting *item*, x-position, y-position,
-            width, height, and visible state as positional arguments that updates the
-            item's size, position, and visibility.
+            width, height, and visible state as positional arguments that updates
+            the item's size, position, and visibility. By default, it is a
+            simple wrapper around `dearpygui.configure_item`.
 
-            * max_size: The maximum width and height the item will scale to. If
-            unspecified, the item's maximum size is without bounds. When specified,
-            *max_width/height* values are ignored.
+            * max_size: The maximum width and height the item will scale to. Inner
+            NaN-like values are not applied.
 
-            * max_width: Individual width component of *max_size*. Cannot be
-            combined with *max_size*.
+            * max_width: Individual width component (first value) of *max_size*.
+            Ignored when *max_size* is specified.
 
-            * max_height: Individual height component of *max_size*. Cannot be
-            combined with *max_size*.
+            * max_height: Individual height component (second value) of *max_size*.
+            Ignored when *max_size* is specified.
 
-            * padding: Overrides slot-level padding values, as `[x1_pad, y1_pad,
-            x1_pad, y1_pad]`, or `[left-padding, upper-padding, right-padding,
-            bottom-padding]`. When *padding* is specified, *x[i]/y[i]_pad* values
-            are ignored.
+            * padding: A 4-item sequence whose values will be used to override the
+            left, upper, right, and/or lower-padding values of the first/last slots
+            in the target cell range, OR, a non-sequence value that will be used
+            as the override value for all padding components. Inner NaN-like values
+            are not applied as an overriding value.
 
-            * x1_pad: Left-padding component of *padding*. Cannot be combined with
-            *padding*.
+            * x1_pad: Overrides the first `.padding` value of the first column
+            (left-padding) in the target cell range. Ignored when *padding* is
+            specified.
 
-            * y1_pad: Upper-padding component of *padding*. Cannot be combined with
-            *padding*.
+            * y1_pad: Overrides the first `.padding` value of the first row
+            (upper-padding) in the target cell range. Ignored when *padding* is
+            specified.
 
-            * x2_pad: Right-padding component of *padding*. Cannot be combined with
-            *padding*.
+            * x2_pad: Overrides the first `.padding` value of the last column
+            (right-padding) in the target cell range. Ignored when *padding* is
+            specified.
 
-            * y2_pad: Bottom-padding component of *padding*. Cannot be combined with
-            *padding*.
+            * y2_pad: Overrides the first `.padding` value of the last row
+            (lower-padding) in the target cell range. Ignored when *padding* is
+            specified.
 
 
-        When it is desired for the item to occupy a single cell, *col* is the cell's
-        column index and *row* is the cell's row index (ex. `grid.push(item, col_idx,
-        row_idx)`). Alternatively, a 2-item sequence can be passed as the *col* argument
-        containing both indicies (ex. `grid.push(item, (col_idx, row_idx)`) while *row*
-        is left unspecified or None. To push an item onto a range of cells, *col*
-        and *row* must both be 2-item sequences containing the coordinates of the
-        first and last cell in the range, respectively.
+        An item attached to the grid must support sizing via `width` and `height`
+        configurations, positioning via `pos`, and visibility updates via `show`.
+        Otherwise, consider attaching a compatible parenting, container item
+        instead. Alternatively, a custom *rect_setter* can be passed to enforce
+        item compatibility.
 
-        Column and row indices can be negative.
+        When it is desired for the item to occupy a single cell, the second and
+        third positional arguments are the target cell's column and row indices,
+        respectively. Alternatively, a 2-item sequence can be passed as the
+        second positional argument containing both indices while leaving the
+        third positional argument unspecified. To push an item onto a range of
+        cells, the second and third positional arguments must both be 2-item
+        sequences containing indices of the endpoint cells in the range. During
+        a draw event, the cell whose indices are nearest to `(0, 0)` is
+        considered the "starting" cell in the range for that event.
 
-        When the grid is (re)drawn, `dearpygui.configure_item` is indirectly
-        called to set the item's size, position, and visibility. In order for an
-        item to to be correctly sized, positioned, and shown, it must support sizing
-        via `width` and `height` configurations, explicit positioning via `pos`,
-        and visibility updates via `show`. If an item does not support one of more
-        of the mentioned configuration options, consider parenting them in another
-        item that does. Alternatively, a 5-argument callable can be used as the
-        *rect_setter* argument; it will be called instead to update the item's
-        configuration. This allows users to force compatibility for otherwise
-        incompatible items (ex. `mvText` items), process other events before/after
-        the resize, or forward the resize event to a different item entirely.
+        Column/row indices can be positive or negative integers. The "indexing"
+        behavior mirrors typical Python subscript behavior; cell coordinates
+        `(-1, 0)` would specify the cell at the last column and first row.
+
+        The exact cell(s) used are evaluated during draw events; deterministic
+        of the grid's state at the time of the event and *not* when the item is
+        attached. A side effect of this is that column and row indices can be
+        outside the grid's range when items are attached. If the target cell or
+        cellspan is out-of-range during a draw event, the item is simply hidden.
+        Additionally, passing a row index of 4 is not the same as -1 even if the
+        grid only has 5 rows at the time of attachment since the exact row is
+        not determined until a draw event occurs.
+
+        During a draw event, *rect_setter* is called to update the item using
+        the finalized size, position, and visibility values. This means that items
+        attached to the grid must support sizing via `width` and `height`
+        configurations, positioning via `pos`, and visibility updates via `show`.
+        If an item does not support one of more of the mentioned configuration
+        options, consider parenting it within a more compatible item and attaching
+        that item instead. Otherwise, a custom *rect_setter* can be used force
+        compatibility of otherwise incompatible items by choosing which settings
+        are updated in their call to `dearpygui.configure_item` or, alternatively,
+        update a different item entirely.
 
         An item's size is usually dependant on the size of the row(s) and column(s)
-        they occupy. *max_size* (OR individual *max_width/height*) values can be set
-        to clamp the item's size as the cell or cellspan expands. However, setting a
-        minimum size per item is not supported. This is because having one cell/item
-        in a row or column of different size than others in that slot is atypical of
-        a grid-layout. When desired, it is recommended to set the `size` attribute of
-        the entire row or column; this will prevent the slot from sizing dynamically
-        when the grid is redrawn. If an item must have a unique minimum size, a custom
-        *rect_setter* can be set that sends other width/height values to
+        they occupy. *max_size* (OR individual *max_width/height*) values can be
+        passed to clamp the item's size as the cell or cellspan expands. Setting a
+        minimum size per item is not supported, since having the content of a
+        cell(span) extend beyond its' borders is not typical of a grid system.
+        When desired, it is recommended to set the `size` attribute of the entire
+        row or column. This sets a "fixed" sizing policy on the slot, preventing it
+        from being dynamically sized. If an item *must* have a unique minimum size,
+        a custom *rect_setter* can be set that sends other width/height values to
         `dearpygui.configure_item`.
 
-        When *padding* is specified, all non-None and non-infinity values are used to
-        override the slot-level padding values. For example, if the column padding
-        (left-padding, right-padding) and row padding (upper-padding, bottom-padding)
-        values are both `[20, 20]` and *padding* is `[10, None, None, None]` (OR
-        `x1_pad=10`), the padding values used when drawing the item will be `[10, 20,
-        20, 20]`, as `[left-padding, upper-padding, right-padding, bottom-padding]`.
-
-        >NOTE: Be mindful of calls made to the grid within your custom *rect_setter*.
-        Under normal operation, attempting to update or draw the grid will result
-        in a deadlock!
+        > NOTE: A grid object that calls *rect_setter* will be holding its' internal
+        mutex. Under normal operation, a *rect_setter* that calls a grid's methods or
+        invokes behavior documented to "await internal lock release" will result in
+        a deadlock.
         """
         if hasattr(cell_start, '__iter__'):  # possible cell range
             try:
@@ -1000,30 +1191,36 @@ class Grid:
                 ) from None
         cellspan = int(x1), int(y1), int(x2), int(y2),
 
-        if _is_null_v(max_size):
-            max_size = _to_float_array((max_width, max_height), 2, 0.0)
-        else:
-            max_size = _to_float_array(max_size, 2, 0.0)
+        if max_size is _is_nanlike(max_size):
+            max_size = (max_width, max_height)
+        max_size = _to_float_arr(max_size, 2, 0.0)
         for i in range(len(max_size)):
             max_size[i] = max(0.0, max_size[i])
 
-        if _is_null_v(padding):
-            padding = _to_float_array((x1_pad, y1_pad, x2_pad, y2_pad), 4, NaN)
-        else:
-            padding = _to_float_array(padding, 4, NaN)
+        if padding is _is_nanlike(padding):
+            padding = (x1_pad, y1_pad, x2_pad, y2_pad)
+        padding = _to_float_arr(padding, 4, NaN)
 
         with self._lock:
-            # Two instances of `ItemData` can potentially exist for the same item
-            # since refs can be integers or strings. Both are removed just in case.
-            if isinstance(item, int):
-                int_id = item
-                str_id = dearpygui.get_item_alias(item)
-            if isinstance(item, str):
-                int_id = dearpygui.get_alias_id(item)
-                str_id = item
-            # XXX: `ItemData.__hash__` forwards to `ItemData.item.__hash__`
-            self._item_data.discard(int_id)  # type: ignore
-            self._item_data.discard(str_id)  # type: ignore
+            self._pop(item)
+
+            # unique handling per item type
+            is_text = False
+            try:
+                item_type = dearpygui.get_item_info(item)['type']
+            except SystemError:
+                # XXX: The item may not exist yet. It is very rare that this is
+                # purposeful, but it happens? Allowing this can create gachas.
+                pass
+            else:
+                if item_type == 'mvAppItemType::mvText':
+                    is_text = True
+                    if rect_setter == _set_item_rect:
+                        rect_setter = _set_text_rect
+                elif item_type == 'mvAppItemType::mvTable':
+                    # BUG: Table items accept a `pos` keyword, but DPG doesn't
+                    # do anything with it.
+                    raise ValueError("`mvTable` items cannot be explicitly positioned.")
 
             item_data = ItemData(
                 item=item,
@@ -1032,185 +1229,80 @@ class Grid:
                 padding=padding,
                 positioner=_get_positioner(anchor),
                 rect_setter=rect_setter,
+                is_text=is_text,
             )
             self._item_data.add(item_data)
             return item_data
 
-    def pop(self, item: Item):
-        """Release an item from the grid.
+    def _upd_slot_states(self, axis: Axis, area_size: float, index_offset: Literal[0, 1]):  # XXX: performance-sensitive
+        area_c1_pad  = self._offsets[0 + index_offset]
+        area_c2_pad  = self._offsets[2 + index_offset]
+        content_size = area_size - area_c1_pad - area_c2_pad
 
-        Awaits internal lock release.
-        """
-        with self._lock:
-            try:
-                self._item_data.remove(item)  # type: ignore
-            except KeyError:
-                if isinstance(item, str):
-                    self._item_data.discard(dearpygui.get_alias_id(item))  # type: ignore
-            try:
-                _item_set_config(item, pos=())
-            except SystemError:
-                pass
+        _slot_c1_pad, _slot_c2_pad = axis._padding
+        if _slot_c1_pad != _slot_c1_pad:  # is NaN?
+            _slot_c1_pad = self._padding[0 + index_offset]
+        if _slot_c2_pad != _slot_c2_pad:  # is NaN?
+            _slot_c2_pad = self._padding[2 + index_offset]
 
-    def clear(self):
-        """Release all items from the grid.
+        _slot_size_offset = axis._spacing
+        if _slot_size_offset != _slot_size_offset:  # is NaN?
+            _slot_size_offset = self._spacing[0 + index_offset]
 
-        Awaits internal lock release.
-        """
-        with self._lock:
-            for item_data in self._item_data:
-                try:
-                    _item_set_config(item_data.item, pos=())
-                except SystemError:
-                    pass
-            self._item_data.clear()
+        slot_pos_offset = _slot_size_offset / 2.0
 
-    __drawlist = '[mvViewportDrawlist] Grid'
+        slot_weight_size = (
+            max(0, (content_size - axis.slot_size())) / max(1, axis.slot_weight())
+        )
 
-    def __call__(self, *args):
-        """Redraw the grid; updating the size, position, and visibility state
-        of any item attached.
+        alloc_size = 0.0
+        for slot in axis:
+            slot_state = slot._state
 
-        Awaits internal lock release.
+            slot_size_offset = slot._spacing
+            if slot_size_offset != slot_size_offset:  # is NaN?
+                slot_size_offset = _slot_size_offset
+            slot_state['spacing'] = slot_size_offset
 
+            slot_state['pos'] = alloc_size + area_c1_pad + slot_pos_offset
 
-        Any item attached to the grid whose cell or cellspan is outside of the
-        grid's range will be hidden.
-        """
-        with self._lock:
-            parent_width, parent_height, parent_x_pos, parent_y_pos, parent_visible = self._rect_getter(self._target)
-            if not self._show or not parent_visible:
-                _item_set_config(self._drawlayer, show=False)
-                return
+            slot_c1_pad, slot_c2_pad = slot._padding
+            if slot_c1_pad != slot_c1_pad:  # is NaN?
+                slot_c1_pad = _slot_c1_pad
+            if slot_c2_pad != slot_c2_pad:  # is NaN?
+                slot_c2_pad = _slot_c2_pad
+            slot_state['padding'] = slot_c1_pad, slot_c2_pad
 
-            area_width  = self._width or parent_width
-            area_height = self._height or parent_height
+            slot_size = slot._size or slot_weight_size * slot._weight  # FIXED or SIZED
+            slot_state['size'] = slot_size - _slot_size_offset
+            alloc_size += slot_size
 
-            cell_map = self._draw_grid_cells(area_width, area_height)
-            self._draw_grid_items(cell_map)
+    def _upd_item_states(self):  # XXX: performance-sensitive
+        rows = self.rows._slots
+        cols = self.cols._slots
 
-            if self._overlay:
-                dearpygui.delete_item(self._drawlayer, children_only=True)
-                _item_set_config(self._drawlayer, show=True)
+        n_cols = len(cols)
+        n_rows = len(rows)
 
-                area_x_max = parent_x_pos + area_width
-                area_y_max = parent_y_pos + area_height
-                self._draw_overlay_outline(
-                    parent_x_pos,
-                    parent_y_pos,
-                    area_x_max,
-                    area_y_max,
-                    (150, 255, 255),
-                    (150, 255, 255, 80),
-                )
-                self._draw_overlay_slots(
-                    cell_map.values(),
-                    parent_x_pos,
-                    parent_y_pos,
-                    area_x_max,
-                    area_y_max,
-                    (150, 255, 255, 120),
-                    (150, 255, 255, 255),
-                    (150, 255, 255, 80),
-                )
-
-    __code__ = __call__.__code__
-
-    def _draw_grid_cells(self, area_width: float, area_height: float) -> dict[tuple[int, int], CellData]:
-        grid_x1_pad, grid_y1_pad, grid_x2_pad, grid_y2_pad = self._offsets
-
-        grid_width  = area_width  - grid_x1_pad - grid_x2_pad
-        grid_height = area_height - grid_y1_pad - grid_y2_pad
-
-        weight_wt = max(0, (grid_width  - self.cols.min_size)) / max(1, self.cols.weight)  # |- `ZeroDivisionError`
-        weight_ht = max(0, (grid_height - self.rows.min_size)) / max(1, self.rows.weight)  # |
-
-        default_x1_pad, default_x2_pad = self.cols._padding
-        if default_x1_pad != default_x1_pad:  # is NaN
-            default_x1_pad = self._padding[0]
-        if default_x2_pad != default_x2_pad:  # is NaN
-            default_x2_pad = self._padding[2]
-        default_y1_pad, default_y2_pad = self.rows._padding
-        if default_y1_pad != default_y1_pad:  # is NaN
-            default_y1_pad = self._padding[1]
-        if default_y2_pad != default_y2_pad:  # is NaN
-            default_y2_pad = self._padding[3]
-
-        cell_wt_offs = self.cols._spacing
-        if cell_wt_offs != cell_wt_offs:  # is NaN
-            cell_wt_offs = self._spacing[0]
-        cell_ht_offs = self.rows._spacing
-        if cell_ht_offs != cell_ht_offs:  # is NaN
-            cell_ht_offs = self._spacing[1]
-
-        cell_x_pos_offs = cell_wt_offs / 2.0
-        cell_y_pos_offs = cell_ht_offs / 2.0
-
-        cols = tuple(enumerate(self.cols._slots))
-
-        alloc_ht = 0.0
-        cell_map = {}
-        for row_idx, row in enumerate(self.rows._slots):
-            _cell_ht   = row.size or weight_ht * row.weight  # FIXED or SIZED
-            cell_ht    = _cell_ht - cell_ht_offs
-            cell_y_pos = grid_y1_pad + alloc_ht + cell_y_pos_offs
-            alloc_ht  += _cell_ht
-
-            cell_y1_pad, cell_y2_pad = row.padding
-
-            if cell_y1_pad != cell_y1_pad:  # is NaN
-                cell_y1_pad = default_y1_pad
-            if cell_y2_pad != cell_y2_pad:  # is NaN
-                cell_y2_pad = default_y2_pad
-
-            alloc_wt = 0.0
-            for col_idx, col in cols:
-                _cell_wt   = col.size or weight_wt * col.weight  # FIXED or SIZED
-                cell_wt    = _cell_wt - cell_wt_offs
-                cell_x_pos = grid_x1_pad + alloc_wt + cell_x_pos_offs
-                alloc_wt  += _cell_wt
-
-                cell_x1_pad, cell_x2_pad = col.padding
-                if cell_x1_pad != cell_x1_pad:  # is NaN
-                    cell_x1_pad = default_x1_pad
-                if cell_x2_pad != cell_x2_pad:  # is NaN
-                    cell_x2_pad = default_x2_pad
-
-                cell_map[(col_idx, row_idx)] = CellData(
-                    col_idx,
-                    row_idx,
-                    cell_x_pos,
-                    cell_y_pos,
-                    cell_wt,
-                    cell_ht,
-                    cell_x1_pad,
-                    cell_y1_pad,
-                    cell_x2_pad,
-                    cell_y2_pad,
-                )
-        return cell_map
-
-    def _draw_grid_items(self, cell_map: dict[tuple[int, int], CellData]):
-        n_rows   = len(self.rows)
-        n_cols   = len(self.cols)
-        rm_items = ()
         for item_data in self._item_data:
-            c1, r1, c2, r2 = item_data.cellspan
+            x1, y1, x2, y2 = item_data.cellspan
             # convert negative indexes
-            r1 %= n_rows
-            c1 %= n_cols
-            r2 %= n_rows
-            c2 %= n_cols
-            # correct inversed cellspan
-            if r1 > r2:
-                r1, r2 = r2, r1
-            if c1 > c2:
-                c1, c2 = c2, c1
+            x1 %= n_cols
+            y1 %= n_rows
+            x2 %= n_cols
+            y2 %= n_rows
+            # fix inversed cellspan
+            if y1 > y2:
+                y1, y2 = y2, y1
+            if x1 > x2:
+                x1, x2 = x2, x1
 
             try:
-                cell1 = cell_map[c1, r1]
-                cell2 = cell_map[c2, r2]
-            except KeyError:  # hide item
+                col1_state = cols[x1]._state
+                row1_state = rows[y1]._state
+                col2_state = cols[x2]._state
+                row2_state = rows[y2]._state
+            except KeyError:  # hide the item - cellspan is out-of-range
                 item_x_pos  = 0
                 item_y_pos  = 0
                 item_width  = 0
@@ -1218,28 +1310,41 @@ class Grid:
                 item_show   = False
             else:
                 x1_pad, y1_pad, x2_pad, y2_pad = item_data.padding
-                # if is NaN
-                if x1_pad != x1_pad:
-                    x1_pad = cell1.x1_pad
-                if y1_pad != y1_pad:
-                    y1_pad = cell1.y1_pad
-                if x2_pad != x2_pad:
-                    x2_pad = cell2.x2_pad
-                if y2_pad != y2_pad:
-                    y2_pad = cell2.y2_pad
 
-                cell_x_pos = cell1.x_pos + x1_pad
-                cell_y_pos = cell1.y_pos + y1_pad
+                if x1_pad != x1_pad:  # is NaN?
+                    x1_pad = col1_state['padding'][0]
+                cell_x_pos = col1_state['pos'] + x1_pad
 
-                item_width, item_height = item_data.max_size
-                cell_width = cell2.x_pos + cell2.width - cell_x_pos - x2_pad
-                if not item_width or item_width > cell_width:
-                    item_width = cell_width
-                cell_height = cell2.y_pos + cell2.height - cell_y_pos - y2_pad
-                if not item_height or item_height > cell_height:
-                    item_height = cell_height
+                if y1_pad != y1_pad:  # is NaN?
+                    y1_pad = row1_state['padding'][0]
+                cell_y_pos  = row1_state['pos'] + y1_pad
 
-                if item_width < 1 or item_height < 1:  # hide item
+                if x2_pad != x2_pad:  # is NaN?
+                    x2_pad = col2_state['padding'][1]
+                cell_width = col2_state['pos'] + col2_state['size'] - cell_x_pos - x2_pad
+
+                if y2_pad != y2_pad:  # is NaN?
+                    y2_pad = row1_state['padding'][1]
+                cell_height = row2_state['pos'] + row2_state['size'] - cell_y_pos - y2_pad
+
+                # XXX: It's really common for users to want to align text items.
+                # Unfortunately, they must be handled differently since their size
+                # is determined by their value and font used.
+                if item_data.is_text:
+                    try:
+                        item_width, item_height = _item_get_state(item_data.item)['rect_size']
+                        # if item_width > cell_width or item_height > cell_height:
+                        #     item_width = item_height = 0
+                    except SystemError:  # does not exist - dealt with below
+                        item_width = item_height = 0
+                else:
+                    item_width, item_height = item_data.max_size
+                    if not item_width or item_width > cell_width:
+                        item_width = cell_width
+                    if not item_height or item_height > cell_height:
+                        item_height = cell_height
+
+                if item_width < 1 or item_height < 1:  # hide the item - size too small
                     item_x_pos = 0
                     item_y_pos = 0
                     item_show  = False
@@ -1265,14 +1370,11 @@ class Grid:
                 )
             except SystemError:
                 if not dearpygui.does_item_exist(item_data.item):
-                    if not rm_items:
-                        rm_items = []
-                    rm_items.append(item_data)
+                    self._trashbin.add(item_data.item)
                 else:
                     raise
-        self._item_data.difference_update(rm_items)
 
-    def _draw_overlay_outline(self, x_min: int, y_min: int, x_max: int, y_max: int, line_color: Sequence[int], pad_color: Sequence[int]):
+    def _draw_outline(self, x_min: int, y_min: int, x_max: int, y_max: int, line_color: Sequence[int], pad_color: Sequence[int]):
         layer = self._drawlayer
         x1_pad, y1_pad, x2_pad, y2_pad = self._offsets
 
@@ -1310,8 +1412,6 @@ class Grid:
                 parent=layer,
             )
 
-        # spacing
-
         # outline
         dearpygui.draw_rectangle(
             (x_min, y_min), (x_max, y_max),
@@ -1320,7 +1420,7 @@ class Grid:
             parent=layer,
         )
 
-    def _draw_overlay_slots(self, cells: Iterable[CellData], x_min: int, y_min: int, x_max: int, y_max: int, line_color: Sequence[int], space_color: Sequence[int], pad_color: Sequence[int], ):
+    def _draw_slots(self, x_min: int, y_min: int, x_max: int, y_max: int, line_color: Sequence[int], space_color: Sequence[int], pad_color: Sequence[int], ):
         layer = self._drawlayer
         x1_pad, y1_pad, x2_pad, y2_pad = self._offsets
         x_space = self.cols._spacing / 2
@@ -1330,90 +1430,51 @@ class Grid:
         cont_x_max = x_max - x2_pad
         cont_y_max = y_max - y2_pad
 
+        for col in self.cols:
+            col_state = col._state
+            cell_x_min  = x_min + col_state['pos']
+            cell_x_max  = cell_x_min + col_state['size']
+            cell_x1_pad, cell_x2_pad = col_state['padding']
 
-        rows = set(range(len(self.rows)))
-        cols = set(range(len(self.cols)))
+            for row in self.rows:
+                row_state = row._state
+                cell_y_min  = y_min + row_state['pos']
+                cell_y_max  = cell_y_min + row_state['size']
+                cell_y1_pad, cell_y2_pad = row_state['padding']
 
-        for cell in cells:
-            cell_x_min  = x_min + cell.x_pos
-            cell_y_min  = y_min + cell.y_pos
-            cell_x_max  = cell_x_min + cell.width
-            cell_y_max  = cell_y_min + cell.height
-            cell_x1_pad = cell.x1_pad
-            cell_y1_pad = cell.y1_pad
-            cell_x2_pad = cell.x2_pad
-            cell_y2_pad = cell.y2_pad
-            # inner cell padding
-            if cell_x1_pad:
-                dearpygui.draw_rectangle(
-                    (cell_x_min              , cell_y_max              ),
-                    (cell_x_min + cell_x1_pad, cell_y_min + cell_y1_pad),
-                    color=(0, 0, 0, 0),
-                    fill=pad_color,  # type: ignore
-                    parent=layer,
-                )
-            if cell_y1_pad:
-                dearpygui.draw_rectangle(
-                    (cell_x_min              , cell_y_min              ),
-                    (cell_x_max - cell_x2_pad, cell_y_min + cell_y1_pad),
-                    color=(0, 0, 0, 0),
-                    fill=pad_color,  # type: ignore
-                    parent=layer,
-                )
-            if cell_x2_pad:
-                dearpygui.draw_rectangle(
-                    (cell_x_max              , cell_y_min              ),
-                    (cell_x_max - cell_x2_pad, cell_y_max - cell_y2_pad),
-                    color=(0, 0, 0, 0),
-                    fill=pad_color,  # type: ignore
-                    parent=layer,
-                )
-            if cell_y2_pad:
-                dearpygui.draw_rectangle(
-                    (cell_x_max              , cell_y_max              ),
-                    (cell_x_min + cell_x1_pad, cell_y_max - cell_y2_pad),
-                    color=(0, 0, 0, 0),
-                    fill=pad_color,  # type: ignore
-                    parent=layer,
-                )
+                if cell_x1_pad:
+                    dearpygui.draw_rectangle(
+                        (cell_x_min              , cell_y_max              ),
+                        (cell_x_min + cell_x1_pad, cell_y_min + cell_y1_pad),
+                        color=(0, 0, 0, 0),
+                        fill=pad_color,  # type: ignore
+                        parent=layer,
+                    )
+                if cell_y1_pad:
+                    dearpygui.draw_rectangle(
+                        (cell_x_min              , cell_y_min              ),
+                        (cell_x_max - cell_x2_pad, cell_y_min + cell_y1_pad),
+                        color=(0, 0, 0, 0),
+                        fill=pad_color,  # type: ignore
+                        parent=layer,
+                    )
+                if cell_x2_pad:
+                    dearpygui.draw_rectangle(
+                        (cell_x_max              , cell_y_min              ),
+                        (cell_x_max - cell_x2_pad, cell_y_max - cell_y2_pad),
+                        color=(0, 0, 0, 0),
+                        fill=pad_color,  # type: ignore
+                        parent=layer,
+                    )
+                if cell_y2_pad:
+                    dearpygui.draw_rectangle(
+                        (cell_x_max              , cell_y_max              ),
+                        (cell_x_min + cell_x1_pad, cell_y_max - cell_y2_pad),
+                        color=(0, 0, 0, 0),
+                        fill=pad_color,  # type: ignore
+                        parent=layer,
+                    )
 
-            # column
-            if cell.col in cols:
-                # outer spacing
-                dearpygui.draw_rectangle(
-                    (cell_x_min          , cont_y_min),
-                    (cell_x_min - x_space, cont_y_max),
-                    color=(0, 0, 0, 0),
-                    fill=space_color,  # type: ignore
-                    parent=layer,
-                )
-                dearpygui.draw_rectangle(
-                    (cell_x_max          , cont_y_min),
-                    (cell_x_max + x_space, cont_y_max),
-                    color=(0, 0, 0, 0),
-                    fill=space_color,  # type: ignore
-                    parent=layer,
-                )
-                # lines
-                dearpygui.draw_line(
-                    (cell_x_min, cont_y_min),
-                    (cell_x_min, cont_y_max),
-                    color=line_color,  # type: ignore
-                    parent=layer,
-                )
-                dearpygui.draw_line(
-                    (cell_x_max, cont_y_min),
-                    (cell_x_max, cont_y_max),
-                    color=line_color,  # type: ignore
-                    parent=layer,
-                )
-                cols.remove(cell.col)
-
-            # row
-            ln_y1_pos = cell.y_pos + y_min
-            ln_y2_pos = ln_y1_pos + cell.height
-            if cell.row in rows:
-                # outer spacing
                 dearpygui.draw_rectangle(
                     (cont_x_min, cell_y_min          ),
                     (cont_x_max, cell_y_min - y_space),
@@ -1441,4 +1502,171 @@ class Grid:
                     color=line_color,  # type: ignore
                     parent=layer,
                 )
-                rows.remove(cell.row)
+
+            # outer spacing
+            dearpygui.draw_rectangle(
+                (cell_x_min          , cont_y_min),
+                (cell_x_min - x_space, cont_y_max),
+                color=(0, 0, 0, 0),
+                fill=space_color,  # type: ignore
+                parent=layer,
+            )
+            dearpygui.draw_rectangle(
+                (cell_x_max          , cont_y_min),
+                (cell_x_max + x_space, cont_y_max),
+                color=(0, 0, 0, 0),
+                fill=space_color,  # type: ignore
+                parent=layer,
+            )
+            # lines
+            dearpygui.draw_line(
+                (cell_x_min, cont_y_min),
+                (cell_x_min, cont_y_max),
+                color=line_color,  # type: ignore
+                parent=layer,
+            )
+            dearpygui.draw_line(
+                (cell_x_max, cont_y_min),
+                (cell_x_max, cont_y_max),
+                color=line_color,  # type: ignore
+                parent=layer,
+            )
+
+    @property
+    def __code__(self):
+        """[get] Return `self.__call__.__code__`.
+
+        Enables `Grid` objects to registered as Dear PyGui callbacks.
+        """
+        return self.__call__.__code__
+
+    def __call__(self, *args):
+        """Draw the grid, updating the size and position of any item
+        attached.
+
+        Awaits internal lock release.
+
+
+        > NOTE: When overriding, redefining, or reassigning this method,
+        the new method must accept variadic positional arguments for
+        `Grid` objects to be callable by Dear PyGui.
+        """
+        with self._lock:
+            self._clean_cache()
+
+            _area_width, _area_height, area_x_pos, area_y_pos, area_visible = self._rect_getter(
+                self._target
+            )
+
+            if self._show and area_visible:
+                area_width = self._width or _area_width
+                self._upd_slot_states(self.cols, area_width, 0)
+                area_height = self._height or _area_height
+                self._upd_slot_states(self.rows, area_height, 1)
+
+                self._upd_item_states()
+
+                if self._overlay:
+                    dearpygui.delete_item(self._drawlayer, children_only=True)
+                    _item_set_config(self._drawlayer, show=True)
+
+                    area_x_max = area_x_pos + area_width
+                    area_y_max = area_y_pos + area_height
+                    self._draw_outline(
+                        area_x_pos,
+                        area_y_pos,
+                        area_x_max,
+                        area_y_max,
+                        (150, 255, 255),
+                        (150, 255, 255, 80),
+                    )
+                    self._draw_slots(
+                        area_x_pos,
+                        area_y_pos,
+                        area_x_max,
+                        area_y_max,
+                        (150, 255, 255, 120),
+                        (150, 255, 255, 255),
+                        (150, 255, 255, 80),
+                    )
+            else:
+                _item_set_config(self._drawlayer, show=False)
+
+
+
+
+if __name__ == '__main__':
+    dpg = dearpygui
+
+
+    dpg.create_context()
+    dpg.setup_dearpygui()
+    dpg.create_viewport()
+    dpg.show_viewport()
+
+    main_window = dpg.add_window()
+    dpg.set_primary_window(main_window, True)
+    dpg.configure_item(main_window, no_scroll_with_mouse=True, no_scrollbar=True)
+
+
+    grid = Grid(2, 4, main_window, overlay=True)
+
+    with dpg.item_handler_registry() as window_hr:
+        dpg.add_item_resize_handler(callback=grid)
+    dpg.bind_item_handler_registry(main_window, window_hr)
+
+
+
+
+    grid.rows[0].size = 28
+    with dpg.child_window(border=True, parent=main_window) as menu_bar:
+        ...
+    grid.push(menu_bar, (0, 0), (-1, 0))
+
+
+    grid.rows[1].size = 100
+    with dpg.child_window(border=True, parent=main_window) as ribbon:
+        ...
+    grid.push(ribbon, (0, 1), (-1, 1))
+
+
+    grid.cols[0].size = 300
+    with dpg.window(no_title_bar=True, no_collapse=True, no_move=True) as left_view:
+        for i in range(10):
+            dpg.add_button(label=f"button {i}",width=-1, height=80)
+
+        def cb_left_view_resize(sender, app_data, user_data):
+            grid.cols[0].size = dpg.get_item_width(user_data)
+            grid()
+
+        with dpg.item_handler_registry() as left_view_hr:
+            dpg.add_item_resize_handler(callback=cb_left_view_resize, user_data=left_view)
+        dpg.bind_item_handler_registry(left_view, left_view_hr)
+    grid.push(left_view, 0, 2)
+
+
+    with dpg.child_window(border=True, parent=main_window, horizontal_scrollbar=True) as right_view:
+        rv_grid = Grid(10, 4, right_view, width=2000, offsets=(2, 12, 2, 12), padding=(8, 8, 8, 8), overlay=True)
+        dpg.add_item_resize_handler(callback=rv_grid, parent=window_hr)
+        dpg.add_item_resize_handler(callback=rv_grid, parent=left_view_hr)
+
+        rv_grid.push(dpg.add_button(label=f"content"), (0, 0), (2, 0))
+        rv_grid.push(dpg.add_button(label=f"content"), (1, 1), (3, 1))
+        rv_grid.push(dpg.add_button(label=f"content"), (2, 2), (4, 2))
+        rv_grid.push(dpg.add_button(label=f"content"), (3, 3), (5, 3))
+        rv_grid.push(dpg.add_button(label=f"content"), (4, 0), (6, 0))
+        rv_grid.push(dpg.add_button(label=f"content"), (5, 1), (7, 1))
+        rv_grid.push(dpg.add_button(label=f"content"), (6, 2), (8, 2))
+        rv_grid.push(dpg.add_button(label=f"content"), (7, 3), (9, 3))
+    grid.push(right_view, (1, 2), (1, 2))
+
+
+    grid.rows[-1].size = 24
+    with dpg.child_window(border=True, parent=main_window) as footer:
+        t = dpg.add_text("hello_world")
+    grid.push(footer, (0, -1), (-1, -1))
+
+
+    while dpg.is_dearpygui_running():
+        dpg.render_dearpygui_frame()
+        grid()
