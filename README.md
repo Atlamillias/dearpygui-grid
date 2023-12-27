@@ -16,19 +16,18 @@ DearPyGui-Grid is a layout management tool for [Dear PyGui](https://github.com/h
 
 <br>
 
-##Features
+## Features
 * create simple to complex layouts *without* the messy web of group, table, theme, and spacer items
 * position widgets in individual cells or over a cell range
 * supports overlapping widgets
 * edge-level padding customization per-slot (row/column) or per widget
-* spacing between rows and columns
-* slot-level static and dynamic sizing (policy emulation)
+* control spacing between rows and columns
+* static and dynamic sizing (policy emulation)
 * optional overlay outlining the grid and its' slots - useful for debugging or designing layouts
-* minimal dependencies
 
 <br>
 
-##Installation
+## Installation
 
 Using Python 3.10 (or newer), DearPyGui-Grid can be installed via `pip`:
 
@@ -38,9 +37,9 @@ python -m pip install dearpygui-grid
 
 <br>
 
-##Usage
+## Usage
 
-####Basic Usage
+#### Basic Usage
 
 A layout object is created by instantiating the `Grid` class. The first two arguments set the initial number of columns and rows in the layout. The third argument, `target`, is the id of the grid's "reference" item. This item is used to help the grid determine its' content position and size when drawn, and is non-optional in most cases. `Grid` also accepts several keyword-only arguments. These, along with `cols`, `rows`, and `target`, can be updated later via the `.configure` method.
 
@@ -79,14 +78,14 @@ dpg.start_dearpygui()
 ```
 <div>
     <p align="center">
-        <img src=""/>
-        <img src=""/>
+        <img src="https://github.com/Atlamillias/dearpygui-grid/blob/main/docs/images/basic_usage_ex1_overlay.png"/>
+        <img src="https://github.com/Atlamillias/dearpygui-grid/blob/main/docs/images/basic_usage_ex1.png"/>
     </p>
     <p style="font-size:12px;text-align:center;font-style:italic;"></p>
     <br>
 </div>
 
-####Padding & Offsets
+#### Padding & Offsets
 
 In the example above, the target window item is configured using the `no_scrollbar` and `no_title_bar` settings. If you try running the script without them, you'll see that the grid does not take into account the size of the window's title bar, meaning that it will slightly overlap any content in the top row. Additionally, the content in the window consumes enough space for the scrollbar to display which, again, clips our content. But, what if you want the grid to behave *with* the scrollbar and title bar? Fortunately, this can also be managed by applying offsets, padding, and spacing to the layout.
 
@@ -129,8 +128,8 @@ dpg.start_dearpygui()
 ```
 <div>
     <p align="center">
-        <img src=""/>
-        <img src=""/>
+        <img src="https://github.com/Atlamillias/dearpygui-grid/blob/main/docs/images/padding_&_offsets_ex1_overlay.png"/>
+        <img src="https://github.com/Atlamillias/dearpygui-grid/blob/main/docs/images/padding_&_offsets_ex1.png"/>
     </p>
     <p style="font-size:12px;text-align:center;font-style:italic;"></p>
     <br>
@@ -172,8 +171,8 @@ dpg.start_dearpygui()
 ```
 <div>
     <p align="center">
-        <img src=""/>
-        <img src=""/>
+        <img src="https://github.com/Atlamillias/dearpygui-grid/blob/main/docs/images/padding_&_offsets_ex2_overlay.png"/>
+        <img src="https://github.com/Atlamillias/dearpygui-grid/blob/main/docs/images/padding_&_offsets_ex2.png"/>
     </p>
     <p style="font-size:12px;text-align:center;font-style:italic;"></p>
     <br>
