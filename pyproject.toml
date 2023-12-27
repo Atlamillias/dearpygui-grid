@@ -23,6 +23,7 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "dearpygui >= 1.9.0",
+    "typing-extensions; python_version < '3.12'",
 ]
 
 [build-system]
